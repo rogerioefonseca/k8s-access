@@ -1,0 +1,51 @@
+#!/bin/bash
+
+tools_list=$(echo 'az jq screen kubectl' | tr " " "\n")
+while IFS= read -r tool; do
+    if ! command -v $tool &> /dev/null
+    then
+        echo "$tool could not be found"
+        exit 0
+    fi
+done <<< "$tools_list"
+
+is_ssh_extension_installed=$(az extension list | jq -r '.[] | .name' | grep ssh)
+if [[ "${is_ssh_extension_installed}" != *"ssh"* ]]; then
+    echo "SSH Extension not found - Installing"
+    az extension add --name ssh
+fi
+
+mkdir -p ~/.screen && chmod 700 ~/.screen
+rm -rf ~/.kube
+export SCREENDIR=$HOME/.screen
+
+subscription=$(az account list | jq -r '.[] | .name' | fzf)
+az account set --subscription="${subscription}"
+
+cluster_list=$(az aks list | jq -r '.[] | .name +  "|" + .resourceGroup + "|" + .privateFqdn' | tr " " "\n")
+local_port=4443
+aks_hosts=""
+jump_host=${JUMPHOST_FQDN}
+while read cluster; do
+    name=$(echo $cluster | awk -F '|' '{print $1}')
+    resource_group=$(echo $cluster | awk -F '|' '{print $2}')
+
+    alevate_kube_fqdn=$(az aks show -n ${name} -g ${resource_group} --query privateFqdn -o tsv)
+    aks_hosts=" ${aks_hosts} -L $local_port:$alevate_kube_fqdn:443"
+
+    az aks get-credentials -n ${name} -g ${resource_group} --overwrite-existing -f $HOME/.kube/config
+
+    if [[ "${cluster}" == *"privatelink"* ]]; then
+        kubectl config set-cluster ${name} --server https://localhost:$local_port
+    fi
+
+    let "local_port+=1"
+done <<< "${cluster_list}"
+
+kubelogin convert-kubeconfig -l azurecli
+screen -ls | grep KUBER | awk -F ' ' '{print $1}' | while read s; do screen -X -S $s quit; done
+screen -d -S "KUBERNETES_JUMPHOST" -m bash -c "az ssh vm --hostname ${jump_host} -- -v ${aks_hosts}   'while sleep 2; do echo JUMPHOST; done'"
+
+echo ""
+echo "To make the actual screen sessions available, you will need to: 'export SCREENDIR=$HOME/.screen; export KUBECONFIG=$HOME/.kube/config'"
+echo "Feel free to add that into your bash initialization or to your /etc/profile"
